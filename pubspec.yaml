@@ -1,7 +1,7 @@
 name: geopulse
 description: GeoPulse - TEFSM groundwater survey viewer (ESP32 over BLE)
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -9,11 +9,15 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  flutter_localizations:
+    sdk: flutter
   flutter_blue_plus: ^1.32.0
   csv: ^6.0.0
   path_provider: ^2.1.0
   permission_handler: ^11.3.0
   file_picker: ^8.0.0
+  shared_preferences: ^2.2.0
+  share_plus: ^10.1.0
 
 dev_dependencies:
   flutter_test:
