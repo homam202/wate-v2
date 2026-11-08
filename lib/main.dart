@@ -7,6 +7,7 @@ import 'dart:math' as math;
 
 import 'package:csv/csv.dart';
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -312,6 +313,51 @@ class AppState extends ChangeNotifier {
 
   void _n() => notifyListeners();
 
+  List<File> localFiles = [];
+
+  Future<void> loadLocalFiles() async {
+    final dir = await getApplicationDocumentsDirectory();
+    localFiles = dir
+        .listSync()
+        .whereType<File>()
+        .where((f) => f.path.toLowerCase().endsWith('.csv'))
+        .toList()
+      ..sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+    _n();
+  }
+
+  /// Pick a CSV from phone storage / Downloads / Drive and copy it into the app folder.
+  Future<String?> importCsv() async {
+    try {
+      final res = await FilePicker.platform.pickFiles(type: FileType.any);
+      if (res == null) return null;
+      final pf = res.files.single;
+      if (!pf.name.toLowerCase().endsWith('.csv')) return 'Please choose a .csv file';
+      final dir = await getApplicationDocumentsDirectory();
+      final dest = File('${dir.path}/${pf.name}');
+      if (pf.path != null) {
+        await File(pf.path!).copy(dest.path);
+      } else if (pf.bytes != null) {
+        await dest.writeAsBytes(pf.bytes!);
+      } else {
+        return 'Could not read the selected file';
+      }
+      currentFile = dest;
+      data = null;
+      await loadLocalFiles();
+      return 'Imported ${pf.name}';
+    } catch (e) {
+      return e.toString();
+    }
+  }
+
+  void selectLocal(File f) {
+    currentFile = f;
+    data = null;
+    _n();
+  }
+
+
   Future<String?> connect(BluetoothDevice d) async {
     try {
       await ble.connect(d);
@@ -533,6 +579,20 @@ class FilesPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            height: 56,
+            child: OutlinedButton.icon(
+              onPressed: () async {
+                final msg = await app.importCsv();
+                toast(msg);
+                if (msg != null && msg.startsWith('Imported')) onDownloaded();
+              },
+              icon: const Icon(Icons.upload_file),
+              label: const Text('Import CSV from phone'),
+            ),
+          ),
+          const SizedBox(height: 8),
           Expanded(
             child: app.files.isEmpty
                 ? const Center(child: Text('No files yet'))
@@ -565,41 +625,80 @@ class FilesPage extends StatelessWidget {
   }
 }
 
-class MapPage extends StatelessWidget {
+class MapPage extends StatefulWidget {
   final AppState app;
   final void Function(String?) toast;
   const MapPage({super.key, required this.app, required this.toast});
+  @override
+  State<MapPage> createState() => _MapPageState();
+}
+
+class _MapPageState extends State<MapPage> {
+  @override
+  void initState() {
+    super.initState();
+    widget.app.loadLocalFiles();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final app = widget.app;
     return ListenableBuilder(
       listenable: app,
       builder: (context, _) {
         final file = app.currentFile;
-        if (file == null) return const Center(child: Text('Download a file first'));
         return ListView(padding: const EdgeInsets.all(16), children: [
-          Text(file.path.split('/').last, style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
           SizedBox(
-            height: 56,
-            child: FilledButton.icon(
-              onPressed: () async => toast(await app.generateMap()),
-              icon: const Icon(Icons.grid_on),
-              label: const Text('Generate Map', style: TextStyle(fontSize: 18)),
+            height: 52,
+            child: OutlinedButton.icon(
+              onPressed: () async => widget.toast(await app.importCsv()),
+              icon: const Icon(Icons.upload_file),
+              label: const Text('Import CSV from phone'),
             ),
           ),
-          const SizedBox(height: 16),
-          if (app.data != null) ...[
-            Container(
-              height: 340,
-              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: CustomPaint(painter: HeatmapPainter(app.data!), size: Size.infinite),
+          if (app.localFiles.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            Text('Saved files', style: Theme.of(context).textTheme.titleSmall),
+            for (final f in app.localFiles)
+              Card(
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(f.path == file?.path ? Icons.radio_button_checked : Icons.radio_button_off),
+                  title: Text(f.path.split('/').last),
+                  onTap: () => app.selectLocal(f),
+                ),
+              ),
+          ],
+          const SizedBox(height: 12),
+          if (file == null)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: Text('Import or download a CSV file')),
+            )
+          else ...[
+            Text(file.path.split('/').last, style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 56,
+              child: FilledButton.icon(
+                onPressed: () async => widget.toast(await app.generateMap()),
+                icon: const Icon(Icons.grid_on),
+                label: const Text('Generate Map', style: TextStyle(fontSize: 18)),
               ),
             ),
-            const SizedBox(height: 12),
-            ColorBarLegend(data: app.data!),
+            const SizedBox(height: 16),
+            if (app.data != null) ...[
+              Container(
+                height: 340,
+                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: CustomPaint(painter: HeatmapPainter(app.data!), size: Size.infinite),
+                ),
+              ),
+              const SizedBox(height: 12),
+              ColorBarLegend(data: app.data!),
+            ],
           ],
         ]);
       },
