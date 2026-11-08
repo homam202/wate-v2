@@ -1,0 +1,658 @@
+// GeoPulse - TEFSM groundwater survey viewer
+// ESP32 (BLE, Nordic UART Service) -> LIST / GET -> CSV -> bilinear heatmap
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:csv/csv.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+void main() => runApp(const GeoPulseApp());
+
+// ───────────────────────── BLE SERVICE ─────────────────────────
+// ESP32 side must expose Nordic UART Service:
+//   RX (phone writes)  6e400002-...   TX (phone gets notifications) 6e400003-...
+class BleService {
+  static final Guid nus = Guid('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+  static final Guid rxUuid = Guid('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
+  static final Guid txUuid = Guid('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+
+  BluetoothDevice? device;
+  BluetoothCharacteristic? _rx, _tx;
+  StreamSubscription<List<int>>? _sub;
+  final _lines = StreamController<String>.broadcast();
+  String _buf = '';
+  int _mtu = 23;
+
+  Stream<String> get lines => _lines.stream;
+  bool get connected => device?.isConnected ?? false;
+
+  Future<void> connect(BluetoothDevice d) async {
+    await FlutterBluePlus.stopScan();
+    await d.connect(timeout: const Duration(seconds: 15));
+    device = d;
+    if (Platform.isAndroid) {
+      try {
+        _mtu = await d.requestMtu(247);
+      } catch (_) {}
+    }
+    final services = await d.discoverServices();
+    for (final s in services) {
+      if (s.uuid != nus) continue;
+      for (final c in s.characteristics) {
+        if (c.uuid == rxUuid) _rx = c;
+        if (c.uuid == txUuid) _tx = c;
+      }
+    }
+    if (_rx == null || _tx == null) {
+      await d.disconnect();
+      throw Exception('UART service not found on device');
+    }
+    await _tx!.setNotifyValue(true);
+    await _sub?.cancel();
+    _sub = _tx!.onValueReceived.listen(_onData);
+  }
+
+  Future<void> disconnect() async {
+    await _sub?.cancel();
+    await device?.disconnect();
+  }
+
+  // Incoming bytes -> complete text lines (split on '\n').
+  void _onData(List<int> bytes) {
+    _buf += utf8.decode(bytes, allowMalformed: true);
+    int i;
+    while ((i = _buf.indexOf('\n')) >= 0) {
+      final line = _buf.substring(0, i).replaceAll('\r', '');
+      _buf = _buf.substring(i + 1);
+      _lines.add(line);
+    }
+  }
+
+  Future<void> send(String cmd) async {
+    final bytes = utf8.encode(cmd);
+    final chunk = math.max(20, _mtu - 3);
+    for (var i = 0; i < bytes.length; i += chunk) {
+      await _rx!.write(bytes.sublist(i, math.min(i + chunk, bytes.length)));
+    }
+  }
+
+  /// Sends LIST\n, collects file names until END_LIST (or 8 s timeout).
+  Future<List<String>> listFiles() async {
+    final names = <String>[];
+    final done = Completer<void>();
+    final sub = lines.listen((l) {
+      final t = l.trim();
+      if (t == 'END_LIST') {
+        if (!done.isCompleted) done.complete();
+      } else if (t.toLowerCase().endsWith('.csv')) {
+        names.add(t);
+      }
+    });
+    try {
+      await send('LIST\n');
+      await done.future.timeout(const Duration(seconds: 8), onTimeout: () {});
+    } finally {
+      await sub.cancel();
+    }
+    return names;
+  }
+
+  /// Sends GET name\n, writes every line to a local file,
+  /// stops when the END_FILE line arrives (15 s idle timeout).
+  Future<File> download(String name, void Function(int lines) onProgress) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/${name.split('/').last}');
+    final sink = file.openWrite();
+    final done = Completer<void>();
+    Timer? idle;
+    var n = 0;
+    void resetIdle() {
+      idle?.cancel();
+      idle = Timer(const Duration(seconds: 15), () {
+        if (!done.isCompleted) done.completeError(TimeoutException('Transfer timed out'));
+      });
+    }
+
+    final sub = lines.listen((l) {
+      if (done.isCompleted) return;
+      resetIdle();
+      final t = l.trim();
+      if (t == 'END_FILE') {
+        done.complete();
+      } else if (t.startsWith('ERR')) {
+        done.completeError(Exception(t));
+      } else {
+        sink.writeln(l);
+        onProgress(++n);
+      }
+    });
+    resetIdle();
+    try {
+      await send('GET $name\n');
+      await done.future;
+    } finally {
+      idle?.cancel();
+      await sub.cancel();
+      await sink.flush();
+      await sink.close();
+    }
+    return file;
+  }
+
+  /// Sends one command and returns the first reply line.
+  Future<String> request(String cmd, {Duration timeout = const Duration(seconds: 20)}) async {
+    final reply = lines.first.timeout(timeout);
+    await send(cmd);
+    return reply;
+  }
+}
+
+// ───────────────────────── DATA MODEL / PARSER ─────────────────────────
+class SurveyData {
+  final List<int> sites; // X axis
+  final List<double> freqs; // Y axis, ascending (row 0 = lowest freq)
+  final List<List<double>> matrix; // matrix[freqIndex][siteIndex] = mV
+  final double min, max;
+  SurveyData(this.sites, this.freqs, this.matrix, this.min, this.max);
+
+  static SurveyData parse(String csvText) {
+    final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: true)
+        .convert(csvText.replaceAll('\r', ''));
+    final vals = <String, double>{};
+    final siteSet = <int>{};
+    final freqSet = <double>{};
+    for (final r in rows) {
+      if (r.length < 4) continue;
+      final site = num.tryParse(r[1].toString());
+      final freq = num.tryParse(r[2].toString());
+      final v = num.tryParse(r[3].toString());
+      if (site == null || freq == null || v == null) continue; // header / junk
+      siteSet.add(site.toInt());
+      freqSet.add(freq.toDouble());
+      vals['${site.toInt()}|${freq.toDouble()}'] = v.toDouble();
+    }
+    if (vals.isEmpty) throw Exception('No valid data rows in file');
+    final sites = siteSet.toList()..sort();
+    final freqs = freqSet.toList()..sort(); // lowest first -> drawn at the bottom
+    final m = List.generate(
+        freqs.length, (fi) => List.generate(sites.length, (si) => vals['${sites[si]}|${freqs[fi]}'] ?? double.nan));
+    final all = vals.values;
+    final mean = all.reduce((a, b) => a + b) / all.length;
+    for (final row in m) {
+      for (var i = 0; i < row.length; i++) {
+        if (row[i].isNaN) row[i] = mean; // fill missing cells
+      }
+    }
+    return SurveyData(sites, freqs, m, all.reduce(math.min), all.reduce(math.max));
+  }
+}
+
+// ───────────────────────── COLOR + INTERPOLATION ─────────────────────────
+Color coolwarm(double t) {
+  t = t.clamp(0.0, 1.0);
+  const c0 = Color(0xFF3B4CC0), c1 = Color(0xFFDDDDDD), c2 = Color(0xFFB40426);
+  return t < 0.5 ? Color.lerp(c0, c1, t * 2)! : Color.lerp(c1, c2, (t - 0.5) * 2)!;
+}
+
+double bilinear(List<List<double>> m, double x, double y) {
+  final rows = m.length, cols = m[0].length;
+  final x0 = x.floor().clamp(0, cols - 1), x1 = math.min(x0 + 1, cols - 1);
+  final y0 = y.floor().clamp(0, rows - 1), y1 = math.min(y0 + 1, rows - 1);
+  final tx = (x - x0).clamp(0.0, 1.0), ty = (y - y0).clamp(0.0, 1.0);
+  final top = m[y0][x0] * (1 - tx) + m[y0][x1] * tx;
+  final bot = m[y1][x0] * (1 - tx) + m[y1][x1] * tx;
+  return top * (1 - ty) + bot * ty;
+}
+
+// ───────────────────────── HEATMAP PAINTER ─────────────────────────
+class HeatmapPainter extends CustomPainter {
+  final SurveyData data;
+  HeatmapPainter(this.data);
+
+  void _text(Canvas c, String s, Offset o, {bool centerX = false, bool right = false, bool centerY = false}) {
+    final tp = TextPainter(
+      text: TextSpan(text: s, style: const TextStyle(fontSize: 10, color: Colors.black87)),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    var dx = o.dx, dy = o.dy;
+    if (centerX) dx -= tp.width / 2;
+    if (right) dx -= tp.width;
+    if (centerY) dy -= tp.height / 2;
+    tp.paint(c, Offset(dx, dy));
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const left = 46.0, right = 8.0, top = 8.0, bottom = 30.0, step = 3.0;
+    final plot = Rect.fromLTRB(left, top, size.width - right, size.height - bottom);
+    final rows = data.freqs.length, cols = data.sites.length;
+    final range = (data.max - data.min).abs() < 1e-9 ? 1.0 : data.max - data.min;
+    final p = Paint();
+
+    for (double py = 0; py < plot.height; py += step) {
+      for (double px = 0; px < plot.width; px += step) {
+        final gx = cols == 1 ? 0.0 : (px + step / 2) / plot.width * (cols - 1);
+        // Y inverted: py=0 is the TOP of the plot => highest row index;
+        // row 0 (lowest frequency = deepest) ends up at the bottom.
+        final gy = rows == 1 ? 0.0 : (plot.height - py - step / 2) / plot.height * (rows - 1);
+        final v = bilinear(data.matrix, gx, gy);
+        p.color = coolwarm((v - data.min) / range);
+        canvas.drawRect(
+            Rect.fromLTWH(plot.left + px, plot.top + py, math.min(step, plot.width - px) + 0.5,
+                math.min(step, plot.height - py) + 0.5),
+            p);
+      }
+    }
+    canvas.drawRect(plot, Paint()..style = PaintingStyle.stroke..color = Colors.black54);
+
+    // X axis: sites
+    final xTicks = math.min(cols, 8);
+    for (var i = 0; i < xTicks; i++) {
+      final idx = xTicks == 1 ? 0 : (i * (cols - 1) / (xTicks - 1)).round();
+      final x = cols == 1 ? plot.center.dx : plot.left + idx / (cols - 1) * plot.width;
+      _text(canvas, '${data.sites[idx]}', Offset(x, plot.bottom + 3), centerX: true);
+    }
+    _text(canvas, 'Site', Offset(plot.center.dx, plot.bottom + 15), centerX: true);
+
+    // Y axis: frequencies (lowest at the bottom)
+    final yTicks = math.min(rows, 10);
+    for (var i = 0; i < yTicks; i++) {
+      final idx = yTicks == 1 ? 0 : (i * (rows - 1) / (yTicks - 1)).round();
+      final y = rows == 1 ? plot.center.dy : plot.bottom - idx / (rows - 1) * plot.height;
+      _text(canvas, '${data.freqs[idx].toStringAsFixed(0)} Hz', Offset(plot.left - 4, y), right: true, centerY: true);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant HeatmapPainter old) => old.data != data;
+}
+
+class ColorBarLegend extends StatelessWidget {
+  final SurveyData data;
+  const ColorBarLegend({super.key, required this.data});
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      Container(
+        height: 18,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(4),
+          gradient: LinearGradient(colors: List.generate(11, (i) => coolwarm(i / 10))),
+        ),
+      ),
+      const SizedBox(height: 4),
+      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+        Text('${data.min.toStringAsFixed(1)} mV'),
+        Text('${data.max.toStringAsFixed(1)} mV'),
+      ]),
+      const SizedBox(height: 6),
+      const Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+        Text('Blue = Water Potential', style: TextStyle(color: Color(0xFF3B4CC0), fontWeight: FontWeight.bold)),
+        Text('Red = Dry Rock', style: TextStyle(color: Color(0xFFB40426), fontWeight: FontWeight.bold)),
+      ]),
+    ]);
+  }
+}
+
+// ───────────────────────── APP STATE ─────────────────────────
+class AppState extends ChangeNotifier {
+  final ble = BleService();
+  List<String> files = [];
+  final downloaded = <String, File>{};
+  String? busyFile;
+  int progress = 0;
+  bool loadingList = false;
+  File? currentFile;
+  SurveyData? data;
+
+  void _n() => notifyListeners();
+
+  Future<String?> connect(BluetoothDevice d) async {
+    try {
+      await ble.connect(d);
+      _n();
+      return null;
+    } catch (e) {
+      return e.toString();
+    }
+  }
+
+  Future<String?> refreshFiles() async {
+    loadingList = true;
+    _n();
+    try {
+      files = await ble.listFiles();
+      return files.isEmpty ? 'No CSV files returned' : null;
+    } catch (e) {
+      return e.toString();
+    } finally {
+      loadingList = false;
+      _n();
+    }
+  }
+
+  Future<String?> download(String name) async {
+    busyFile = name;
+    progress = 0;
+    _n();
+    try {
+      final f = await ble.download(name, (n) {
+        progress = n;
+        _n();
+      });
+      downloaded[name] = f;
+      currentFile = f;
+      data = null;
+      return null;
+    } catch (e) {
+      return e.toString();
+    } finally {
+      busyFile = null;
+      _n();
+    }
+  }
+
+  Future<String?> generateMap() async {
+    try {
+      data = SurveyData.parse(await currentFile!.readAsString());
+      _n();
+      return null;
+    } catch (e) {
+      return e.toString();
+    }
+  }
+}
+
+// ───────────────────────── UI ─────────────────────────
+class GeoPulseApp extends StatelessWidget {
+  const GeoPulseApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        title: 'GeoPulse',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(colorSchemeSeed: const Color(0xFF00796B), useMaterial3: true),
+        home: const Shell(),
+      );
+}
+
+class Shell extends StatefulWidget {
+  const Shell({super.key});
+  @override
+  State<Shell> createState() => _ShellState();
+}
+
+class _ShellState extends State<Shell> {
+  final app = AppState();
+  int tab = 0;
+
+  void toast(String? msg) {
+    if (msg == null || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      ConnectPage(app: app, toast: toast, onConnected: () => setState(() => tab = 1)),
+      FilesPage(app: app, toast: toast, onDownloaded: () => setState(() => tab = 2)),
+      MapPage(app: app, toast: toast),
+      SettingsPage(app: app, toast: toast),
+    ];
+    return Scaffold(
+      appBar: AppBar(
+        centerTitle: true,
+        title: Row(mainAxisSize: MainAxisSize.min, children: [
+          Image.asset('assets/icon/logo.png', height: 32),
+          const SizedBox(width: 8),
+          const Text('GeoPulse'),
+        ]),
+      ),
+      body: SafeArea(child: pages[tab]),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.bluetooth), label: 'Connect'),
+          NavigationDestination(icon: Icon(Icons.folder_open), label: 'Files'),
+          NavigationDestination(icon: Icon(Icons.map), label: 'Map'),
+          NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
+        ],
+      ),
+    );
+  }
+}
+
+class ConnectPage extends StatelessWidget {
+  final AppState app;
+  final void Function(String?) toast;
+  final VoidCallback onConnected;
+  const ConnectPage({super.key, required this.app, required this.toast, required this.onConnected});
+
+  Future<void> _scan() async {
+    final st = await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.locationWhenInUse].request();
+    if (st[Permission.bluetoothScan]?.isDenied == true) {
+      toast('Bluetooth permission required');
+      return;
+    }
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: app,
+      builder: (context, _) => Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(children: [
+          SizedBox(
+            width: double.infinity,
+            height: 64,
+            child: FilledButton.icon(
+              onPressed: _scan,
+              icon: const Icon(Icons.bluetooth_searching, size: 28),
+              label: const Text('Scan & Connect', style: TextStyle(fontSize: 20)),
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (app.ble.connected)
+            Card(
+              color: Colors.green.shade50,
+              child: ListTile(
+                leading: const Icon(Icons.check_circle, color: Colors.green),
+                title: Text(app.ble.device?.platformName ?? 'Connected'),
+                trailing: TextButton(
+                    onPressed: () async {
+                      await app.ble.disconnect();
+                      app.notifyListeners();
+                    },
+                    child: const Text('Disconnect')),
+              ),
+            ),
+          Expanded(
+            child: StreamBuilder<List<ScanResult>>(
+              stream: FlutterBluePlus.scanResults,
+              initialData: const [],
+              builder: (context, snap) {
+                final list = (snap.data ?? []).where((r) => r.device.platformName.isNotEmpty).toList()
+                  ..sort((a, b) => (b.device.platformName.contains('TEFSM') ? 1 : 0) -
+                      (a.device.platformName.contains('TEFSM') ? 1 : 0));
+                return ListView(
+                  children: [
+                    for (final r in list)
+                      Card(
+                        child: ListTile(
+                          leading: const Icon(Icons.sensors),
+                          title: Text(r.device.platformName),
+                          subtitle: Text('${r.device.remoteId}  •  ${r.rssi} dBm'),
+                          trailing: const Icon(Icons.link),
+                          onTap: () async {
+                            final err = await app.connect(r.device);
+                            toast(err ?? 'Connected');
+                            if (err == null) onConnected();
+                          },
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+class FilesPage extends StatelessWidget {
+  final AppState app;
+  final void Function(String?) toast;
+  final VoidCallback onDownloaded;
+  const FilesPage({super.key, required this.app, required this.toast, required this.onDownloaded});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: app,
+      builder: (context, _) => Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(children: [
+          SizedBox(
+            width: double.infinity,
+            height: 56,
+            child: FilledButton.tonalIcon(
+              onPressed: !app.ble.connected || app.loadingList ? null : () async => toast(await app.refreshFiles()),
+              icon: app.loadingList
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.refresh),
+              label: const Text('Get file list'),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: app.files.isEmpty
+                ? const Center(child: Text('No files yet'))
+                : ListView(children: [
+                    for (final f in app.files)
+                      Card(
+                        child: ListTile(
+                          leading: Icon(app.downloaded.containsKey(f) ? Icons.check_circle : Icons.description,
+                              color: app.downloaded.containsKey(f) ? Colors.green : null),
+                          title: Text(f),
+                          subtitle: app.busyFile == f ? Text('${app.progress} lines received...') : null,
+                          trailing: app.busyFile == f
+                              ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                              : FilledButton(
+                                  onPressed: app.busyFile != null
+                                      ? null
+                                      : () async {
+                                          final err = await app.download(f);
+                                          toast(err ?? 'Downloaded $f');
+                                          if (err == null) onDownloaded();
+                                        },
+                                  child: const Text('Download')),
+                        ),
+                      ),
+                  ]),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+class MapPage extends StatelessWidget {
+  final AppState app;
+  final void Function(String?) toast;
+  const MapPage({super.key, required this.app, required this.toast});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: app,
+      builder: (context, _) {
+        final file = app.currentFile;
+        if (file == null) return const Center(child: Text('Download a file first'));
+        return ListView(padding: const EdgeInsets.all(16), children: [
+          Text(file.path.split('/').last, style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 56,
+            child: FilledButton.icon(
+              onPressed: () async => toast(await app.generateMap()),
+              icon: const Icon(Icons.grid_on),
+              label: const Text('Generate Map', style: TextStyle(fontSize: 18)),
+            ),
+          ),
+          const SizedBox(height: 16),
+          if (app.data != null) ...[
+            Container(
+              height: 340,
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: CustomPaint(painter: HeatmapPainter(app.data!), size: Size.infinite),
+              ),
+            ),
+            const SizedBox(height: 12),
+            ColorBarLegend(data: app.data!),
+          ],
+        ]);
+      },
+    );
+  }
+}
+
+class SettingsPage extends StatefulWidget {
+  final AppState app;
+  final void Function(String?) toast;
+  const SettingsPage({super.key, required this.app, required this.toast});
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  bool busy = false;
+
+  // ESP32 should reply with ONE line, e.g. "OTA:UP_TO_DATE v1.0.3" or "OTA:UPDATING v1.0.4"
+  Future<void> _checkOta() async {
+    if (!widget.app.ble.connected) return widget.toast('Connect to the device first');
+    setState(() => busy = true);
+    try {
+      final r = await widget.app.ble.request('OTA_CHECK\n');
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Firmware'),
+          content: Text(r),
+          actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+        ),
+      );
+    } catch (e) {
+      widget.toast('No reply: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      Card(
+        child: ListTile(
+          leading: busy
+              ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Icon(Icons.system_update),
+          title: const Text('Check for Firmware Update'),
+          subtitle: const Text('Device checks for a new version over Wi-Fi'),
+          onTap: busy ? null : _checkOta,
+        ),
+      ),
+    ]);
+  }
+}
