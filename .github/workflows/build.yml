@@ -54,6 +54,15 @@ jobs:
           open(p, 'w').write(s)
           PY
 
+      - name: Raise compileSdk to 36
+        run: |
+          for f in android/app/build.gradle.kts android/app/build.gradle; do
+            if [ -f "$f" ]; then
+              sed -i -E 's/compileSdk(Version)? *=? *flutter\.compileSdkVersion/compileSdk = 36/' "$f"
+              grep -n "compileSdk" "$f" || true
+            fi
+          done
+
       - run: flutter pub get
 
       - name: Generate launcher icons
